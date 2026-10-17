@@ -9,6 +9,7 @@ from .layers.utils.mlp import MLP
 from navsim.agents.drivoR.utils import pylogger
 log = pylogger.get_pylogger(__name__)
 import logging
+from .law_world_model import LAWRegisterWorldModel
 # log.setLevel(logging.DEBUG)
 
 class DrivoRModel(nn.Module):
@@ -101,6 +102,17 @@ class DrivoRModel(nn.Module):
         # scorer
         self.scorer = Scorer(config)
 
+        if config.world_model.enabled:
+            self.world_model = LAWRegisterWorldModel(
+                d_model=config.tf_d_model,
+                num_poses=config.num_poses,
+                num_layers=config.world_model.num_layers,
+                nhead=config.world_model.nhead,
+                dim_feedforward=config.world_model.dim_feedforward,
+                dropout=config.world_model.dropout,
+                use_heading=config.world_model.use_heading,
+            )
+
         self.b2d=config.b2d
 
 
@@ -133,8 +145,12 @@ class DrivoRModel(nn.Module):
             else:
                 raise ValueError
 
-            scene_tokens = self.scene_embeds.repeat(batch_size, 1, 1, 1)
-            image_scene_tokens = self.image_backbone(img, scene_tokens)
+            # scene_tokens = self.scene_embeds.repeat(batch_size, 1, 1, 1)
+            # image_scene_tokens = self.image_backbone(img, scene_tokens)
+            image_scene_tokens = self.encode_camera_registers(
+                img,
+                apply_grid_mask=True,
+            )
 
             log.debug(f"Backbone image - {image_scene_tokens.shape}")
             scene_features.append(image_scene_tokens)
@@ -202,7 +218,40 @@ class DrivoRModel(nn.Module):
         output["trajectory"] = trajectory
         output["pdm_score"] = pdm_score
 
+        if self.training and self._config.world_model.enabled:
+            output["current_registers"] = image_scene_tokens
+
         return output
+
+
+
+    def encode_camera_registers(
+        self,
+        img: torch.Tensor,
+        apply_grid_mask: bool = True,
+    ):
+        batch_size = img.shape[0]
+
+        scene_tokens = self.scene_embeds.repeat(
+            batch_size, 1, 1, 1
+        )
+
+        return self.image_backbone(
+            img,
+            scene_tokens,
+            apply_grid_mask=apply_grid_mask,
+        )
+
+
+    def predict_future_registers(
+        self,
+        current_registers: torch.Tensor,
+        trajectory: torch.Tensor,
+    ):
+        return self.world_model(
+            current_registers,
+            trajectory,
+        )
 
 
 

@@ -27,6 +27,52 @@ from navsim.planning.training.abstract_feature_target_builder import (
 from PIL import Image
 from scipy.interpolate import CubicSpline
 
+
+# def _future_camera_tensor(cameras, config) -> torch.Tensor:
+#         camera_list = [
+#             cameras.cam_f0,
+#             cameras.cam_b0,
+#             cameras.cam_l0,
+#             cameras.cam_l1,
+#             cameras.cam_l2,
+#             cameras.cam_r0,
+#             cameras.cam_r1,
+#             cameras.cam_r2,
+#         ]
+    
+#         images = []
+#         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+#         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    
+#         for cam in camera_list:
+#             if cam.image is None:
+#                 continue
+    
+#             im = Image.fromarray(cam.image)
+#             im = im.resize(config.image_size)
+#             im = np.asarray(im, dtype=np.float32) / 255.0
+#             im = (im - mean) / std
+#             im = torch.from_numpy(im).permute(2, 0, 1)
+#             images.append(im)
+    
+#         expected_num_cams = sum(
+#             int(len(config[k]) > 0)
+#             for k in [
+#                 "cam_f0", "cam_b0",
+#                 "cam_l0", "cam_l1", "cam_l2",
+#                 "cam_r0", "cam_r1", "cam_r2",
+#             ]
+#         )
+    
+#         if len(images) != expected_num_cams:
+#             raise RuntimeError(
+#                 f"Expected {expected_num_cams} future cameras, "
+#                 f"but loaded {len(images)}. Check SensorConfig future indices."
+#             )
+    
+#         return torch.stack(images)
+
+
 class DrivoRFeatureBuilder(AbstractFeatureBuilder):
     def __init__(self, config: Dict):
         self._config = config
@@ -196,6 +242,122 @@ class DrivoRFeatureBuilder(AbstractFeatureBuilder):
         # return torch.tensor(features)
         return {"lidar_feature": torch.tensor(features)}
 
+
+
+def _future_camera_tensor(cameras, config):
+    """
+    Build future multi-camera tensor with a fixed shape.
+
+    Returns:
+        future_image:
+            [N_enabled_cams, 3, H, W], float32
+        world_valid:
+            scalar bool tensor.
+            True only when ALL enabled future cameras are available.
+
+    Missing future cameras are filled with zeros so that DataLoader
+    collation always sees the same dictionary keys and tensor shapes.
+    The zero-filled sample will later be excluded from world-model loss
+    using world_valid.
+    """
+
+    # Must use exactly the same camera ordering as current-frame DrivoR.
+    camera_names = [
+        "cam_f0",
+        "cam_b0",
+        "cam_l0",
+        "cam_l1",
+        "cam_l2",
+        "cam_r0",
+        "cam_r1",
+        "cam_r2",
+    ]
+
+    # PIL resize uses (width, height)
+    width = int(config.image_size[0])
+    height = int(config.image_size[1])
+
+    mean = np.array(
+        [0.485, 0.456, 0.406],
+        dtype=np.float32,
+    )
+    std = np.array(
+        [0.229, 0.224, 0.225],
+        dtype=np.float32,
+    )
+
+    images = []
+    world_valid = True
+
+    for camera_name in camera_names:
+
+        # This camera is disabled in the DrivoR yaml.
+        if len(config[camera_name]) == 0:
+            continue
+
+        camera = (
+            getattr(cameras, camera_name, None)
+            if cameras is not None
+            else None
+        )
+
+        # Future frame/camera unavailable.
+        if camera is None or camera.image is None:
+            world_valid = False
+
+            # Placeholder only for DataLoader collation.
+            # It will never participate in world loss.
+            images.append(
+                torch.zeros(
+                    (3, height, width),
+                    dtype=torch.float32,
+                )
+            )
+            continue
+
+        # Same preprocessing as DrivoR current RGB branch.
+        im = Image.fromarray(camera.image)
+
+        im = im.resize(
+            (width, height)
+        )
+
+        im = np.asarray(
+            im,
+            dtype=np.float32,
+        ) / 255.0
+
+        im = (
+            im - mean
+        ) / std
+
+        im = torch.from_numpy(
+            im
+        ).permute(2, 0, 1).contiguous()
+
+        images.append(im)
+
+    # This means the yaml itself has no enabled camera.
+    if len(images) == 0:
+        raise RuntimeError(
+            "No camera is enabled for the DrivoR world-model branch. "
+            "Check cam_f0/cam_b0/cam_l*/cam_r* in drivoR.yaml."
+        )
+
+    future_image = torch.stack(
+        images,
+        dim=0,
+    )
+
+    world_valid = torch.tensor(
+        world_valid,
+        dtype=torch.bool,
+    )
+
+    return future_image, world_valid
+
+
+
 class DrivoRTargetBuilder(AbstractTargetBuilder):
     def __init__(self, config: Dict):
         self._config = config
@@ -204,62 +366,325 @@ class DrivoRTargetBuilder(AbstractTargetBuilder):
         """Inherited, see superclass."""
         return "drivor_target"
 
-    def compute_targets(self, scene: Scene) -> Dict[str, torch.Tensor]:
-        """Inherited, see superclass."""
+    # def compute_targets(self, scene: Scene) -> Dict[str, torch.Tensor]:
+    #     """Inherited, see superclass."""
 
+    #     trajectory = torch.tensor(
+    #         scene.get_future_trajectory(
+    #             num_trajectory_frames=self._config.trajectory_sampling.num_poses
+    #         ).poses
+    #     )
+    #     # frame_idx = scene.scene_metadata.num_history_frames - 1
+    #     # annotations = scene.frames[frame_idx].annotations
+    #     # ego_pose = StateSE2(*scene.frames[frame_idx].ego_status.ego_pose)
+
+    #     # agent_states, agent_labels = self._compute_agent_targets(annotations)
+    #     # bev_semantic_map = self._compute_bev_semantic_map(annotations, scene.map_api, ego_pose)
+
+    #     if self._config.long_trajectory_additional_poses > 0:
+    #         try:
+    #             trajectory_long = scene.get_future_trajectory(
+    #                     num_trajectory_frames=self._config.trajectory_sampling.num_poses + self._config.long_trajectory_additional_poses
+    #                 ).poses
+    #             x = np.arange(trajectory_long.shape[0], dtype=np.float32)
+    #             alpha = 2 * self._config.long_trajectory_additional_poses / (self._config.trajectory_sampling.num_poses*(self._config.trajectory_sampling.num_poses+1))
+    #             x_new = np.arange(trajectory.shape[0], dtype=np.float32)
+    #             off_sets = np.cumsum((x_new+1)*alpha)
+    #             x_new += off_sets
+    #             traj_ = []
+    #             for i in range(3):
+    #                 y = trajectory_long[:,i]
+    #                 cs = CubicSpline(x, y)
+    #                 traj_.append(cs(x_new))
+    #             trajectory_long = np.stack(traj_, axis=1)
+
+    #             trajectory_long = torch.tensor(trajectory_long)
+    #             return {
+    #                 "trajectory": trajectory,
+    #                 "trajectory_long": trajectory_long,
+    #                 "token":scene.scene_metadata.initial_token
+    #             }
+    #         except:
+    #             return {
+    #                 "trajectory": trajectory,
+    #                 "trajectory_long": trajectory,
+    #                 # "agent_states": agent_states,
+    #                 # "agent_labels": agent_labels,
+    #                 # "bev_semantic_map": bev_semantic_map,
+    #                 "token":scene.scene_metadata.initial_token
+    #             }
+    #     else:
+
+    #         return {
+    #             "trajectory": trajectory,
+    #             # "agent_states": agent_states,
+    #             # "agent_labels": agent_labels,
+    #             # "bev_semantic_map": bev_semantic_map,
+    #             "token":scene.scene_metadata.initial_token
+    #         }
+    
+    # def compute_targets(self, scene: Scene) -> Dict[str, torch.Tensor]:
+    #     """Inherited, see superclass."""
+
+    #     # ---------------------------------------------------------
+    #     # 1. Original DrivoR trajectory target
+    #     # ---------------------------------------------------------
+    #     trajectory = torch.tensor(
+    #         scene.get_future_trajectory(
+    #             num_trajectory_frames=
+    #             self._config.trajectory_sampling.num_poses
+    #         ).poses
+    #     )
+
+    #     targets = {
+    #         "trajectory": trajectory,
+    #         "token": scene.scene_metadata.initial_token,
+    #     }
+
+    #     # ---------------------------------------------------------
+    #     # 2. Original long trajectory target
+    #     # ---------------------------------------------------------
+    #     if self._config.long_trajectory_additional_poses > 0:
+    #         try:
+    #             trajectory_long = scene.get_future_trajectory(
+    #                 num_trajectory_frames=(
+    #                     self._config.trajectory_sampling.num_poses
+    #                     + self._config.long_trajectory_additional_poses
+    #                 )
+    #             ).poses
+
+    #             x = np.arange(
+    #                 trajectory_long.shape[0],
+    #                 dtype=np.float32,
+    #             )
+
+    #             alpha = (
+    #                 2
+    #                 * self._config.long_trajectory_additional_poses
+    #                 / (
+    #                     self._config.trajectory_sampling.num_poses
+    #                     * (
+    #                         self._config.trajectory_sampling.num_poses
+    #                         + 1
+    #                     )
+    #                 )
+    #             )
+
+    #             x_new = np.arange(
+    #                 trajectory.shape[0],
+    #                 dtype=np.float32,
+    #             )
+
+    #             off_sets = np.cumsum(
+    #                 (x_new + 1) * alpha
+    #             )
+
+    #             x_new += off_sets
+
+    #             traj_ = []
+
+    #             for i in range(3):
+    #                 y = trajectory_long[:, i]
+
+    #                 cs = CubicSpline(
+    #                     x,
+    #                     y,
+    #                 )
+
+    #                 traj_.append(
+    #                     cs(x_new)
+    #                 )
+
+    #             trajectory_long = np.stack(
+    #                 traj_,
+    #                 axis=1,
+    #             )
+
+    #             targets["trajectory_long"] = torch.tensor(
+    #                 trajectory_long
+    #             )
+
+    #         except Exception:
+    #             # Keep original fallback behavior
+    #             targets["trajectory_long"] = trajectory
+
+    #     # ---------------------------------------------------------
+    #     # 3. LAW-style future RGB target
+    #     #    Only required when world model is enabled
+    #     # ---------------------------------------------------------
+    #     if self._config.world_model.enabled:
+
+    #         # Current frame is the last history frame.
+    #         current_frame_idx = (
+    #             scene.scene_metadata.num_history_frames - 1
+    #         )
+
+    #         # Example:
+    #         # future_offset_frames = 1 -> +0.5s
+    #         # future_offset_frames = 2 -> +1.0s
+    #         # future_offset_frames = 3 -> +1.5s
+    #         future_frame_idx = (
+    #             current_frame_idx
+    #             + self._config.world_model.future_offset_frames
+    #         )
+
+    #         # Safety check
+    #         if future_frame_idx >= len(scene.frames):
+    #             raise IndexError(
+    #                 f"future_frame_idx={future_frame_idx}, "
+    #                 f"but scene only contains {len(scene.frames)} frames. "
+    #                 f"current_frame_idx={current_frame_idx}, "
+    #                 f"future_offset_frames="
+    #                 f"{self._config.world_model.future_offset_frames}"
+    #             )
+
+    #         # Convert future multi-camera images using the same
+    #         # preprocessing as the current-frame DrivoR input.
+    #         targets["future_image"] = _future_camera_tensor(
+    #             scene.frames[future_frame_idx].cameras,
+    #             self._config,
+    #         )
+
+    #     # ---------------------------------------------------------
+    #     # 4. Unified return
+    #     # ---------------------------------------------------------
+    #     return targets
+
+    def compute_targets(self, scene: Scene) -> Dict[str, torch.Tensor]:
+        """Build DrivoR targets plus LAW-style future-frame target."""
+
+        # ============================================================
+        # 1. Original DrivoR trajectory target
+        # ============================================================
         trajectory = torch.tensor(
             scene.get_future_trajectory(
-                num_trajectory_frames=self._config.trajectory_sampling.num_poses
+                num_trajectory_frames=
+                self._config.trajectory_sampling.num_poses
             ).poses
         )
-        # frame_idx = scene.scene_metadata.num_history_frames - 1
-        # annotations = scene.frames[frame_idx].annotations
-        # ego_pose = StateSE2(*scene.frames[frame_idx].ego_status.ego_pose)
 
-        # agent_states, agent_labels = self._compute_agent_targets(annotations)
-        # bev_semantic_map = self._compute_bev_semantic_map(annotations, scene.map_api, ego_pose)
+        targets = {
+            "trajectory": trajectory,
+            "token": scene.scene_metadata.initial_token,
+        }
 
+        # ============================================================
+        # 2. Original DrivoR long-trajectory target
+        # ============================================================
         if self._config.long_trajectory_additional_poses > 0:
             try:
                 trajectory_long = scene.get_future_trajectory(
-                        num_trajectory_frames=self._config.trajectory_sampling.num_poses + self._config.long_trajectory_additional_poses
-                    ).poses
-                x = np.arange(trajectory_long.shape[0], dtype=np.float32)
-                alpha = 2 * self._config.long_trajectory_additional_poses / (self._config.trajectory_sampling.num_poses*(self._config.trajectory_sampling.num_poses+1))
-                x_new = np.arange(trajectory.shape[0], dtype=np.float32)
-                off_sets = np.cumsum((x_new+1)*alpha)
-                x_new += off_sets
-                traj_ = []
+                    num_trajectory_frames=(
+                        self._config.trajectory_sampling.num_poses
+                        + self._config.long_trajectory_additional_poses
+                    )
+                ).poses
+
+                x = np.arange(
+                    trajectory_long.shape[0],
+                    dtype=np.float32,
+                )
+
+                alpha = (
+                    2
+                    * self._config.long_trajectory_additional_poses
+                    / (
+                        self._config.trajectory_sampling.num_poses
+                        * (
+                            self._config.trajectory_sampling.num_poses
+                            + 1
+                        )
+                    )
+                )
+
+                x_new = np.arange(
+                    trajectory.shape[0],
+                    dtype=np.float32,
+                )
+
+                offsets = np.cumsum(
+                    (x_new + 1) * alpha
+                )
+
+                x_new = x_new + offsets
+
+                traj_interpolated = []
+
                 for i in range(3):
-                    y = trajectory_long[:,i]
-                    cs = CubicSpline(x, y)
-                    traj_.append(cs(x_new))
-                trajectory_long = np.stack(traj_, axis=1)
+                    y = trajectory_long[:, i]
 
-                trajectory_long = torch.tensor(trajectory_long)
-                return {
-                    "trajectory": trajectory,
-                    "trajectory_long": trajectory_long,
-                    "token":scene.scene_metadata.initial_token
-                }
-            except:
-                return {
-                    "trajectory": trajectory,
-                    "trajectory_long": trajectory,
-                    # "agent_states": agent_states,
-                    # "agent_labels": agent_labels,
-                    # "bev_semantic_map": bev_semantic_map,
-                    "token":scene.scene_metadata.initial_token
-                }
-        else:
+                    cs = CubicSpline(
+                        x,
+                        y,
+                    )
 
-            return {
-                "trajectory": trajectory,
-                # "agent_states": agent_states,
-                # "agent_labels": agent_labels,
-                # "bev_semantic_map": bev_semantic_map,
-                "token":scene.scene_metadata.initial_token
-            }
+                    traj_interpolated.append(
+                        cs(x_new)
+                    )
+
+                trajectory_long = np.stack(
+                    traj_interpolated,
+                    axis=1,
+                )
+
+                targets["trajectory_long"] = torch.tensor(
+                    trajectory_long,
+                    dtype=trajectory.dtype,
+                )
+
+            except Exception:
+                # Preserve original fallback behavior.
+                targets["trajectory_long"] = trajectory
+
+        # ============================================================
+        # 3. LAW-style future-image target
+        # ============================================================
+        if self._config.world_model.enabled:
+
+            # Current observation = last history frame.
+            current_frame_idx = (
+                scene.scene_metadata.num_history_frames - 1
+            )
+
+            future_frame_idx = (
+                current_frame_idx
+                + int(
+                    self._config.world_model.future_offset_frames
+                )
+            )
+
+            # --------------------------------------------------------
+            # IMPORTANT:
+            # Do not raise an exception when the future frame does not
+            # exist. Return a fixed-shape placeholder + world_valid=False.
+            # --------------------------------------------------------
+            if (
+                future_frame_idx < 0
+                or future_frame_idx >= len(scene.frames)
+            ):
+                future_cameras = None
+
+            else:
+                future_cameras = (
+                    scene.frames[
+                        future_frame_idx
+                    ].cameras
+                )
+
+            future_image, world_valid = (
+                _future_camera_tensor(
+                    future_cameras,
+                    self._config,
+                )
+            )
+
+            # Always return both keys so DataLoader can collate batches.
+            targets["future_image"] = future_image
+            targets["world_valid"] = world_valid
+
+        return targets
+
+
 
     def _compute_agent_targets(self, annotations: Annotations) -> Tuple[torch.Tensor, torch.Tensor]:
         """

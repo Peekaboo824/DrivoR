@@ -356,14 +356,14 @@ class ImgEncoder(torch.nn.Module):
 
     
     # def forward(self, data_dict):
-    def forward(self, img, scene_tokens):
+    def forward(self, img, scene_tokens, apply_grid_mask=True,):
 
 
         B, N, C, H, W = img.size()
         # print("img.shape ", img.shape)
         img = rearrange(img, 'b n c h w -> (b n) c h w')
         # img = img.reshape(B * N, C, H, W)
-        if self.use_grid_mask:
+        if self.use_grid_mask and apply_grid_mask:
             img = self.grid_mask(img)
 
         scene_tokens = rearrange(scene_tokens, 'b n t c -> (b n) t c')

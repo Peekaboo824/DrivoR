@@ -73,8 +73,16 @@ class Cameras:
             camera_identifier = camera_name.lower()
             if camera_identifier in sensor_names:
                 image_path = sensor_blobs_path / camera_dict[camera_name]["data_path"]
+                try:
+                    image = np.array(Image.open(image_path))
+                except (FileNotFoundError, OSError):
+                    # Declared but absent on disk (e.g. a world-model future frame
+                    # at the tail of a stored image segment). The scene is still
+                    # kept and trains like the baseline; the world-model branch is
+                    # masked out via world_valid=False.
+                    image = None
                 data_dict[camera_identifier] = Camera(
-                    image=np.array(Image.open(image_path)),
+                    image=image,
                     sensor2lidar_rotation=camera_dict[camera_name]["sensor2lidar_rotation"],
                     sensor2lidar_translation=camera_dict[camera_name]["sensor2lidar_translation"],
                     intrinsics=camera_dict[camera_name]["cam_intrinsic"],

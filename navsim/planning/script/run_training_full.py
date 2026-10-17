@@ -105,6 +105,12 @@ def main(cfg: DictConfig) -> None:
     logger.info("Building Agent")
     agent: AbstractAgent = instantiate(cfg.agent)
 
+    # 训练时也允许从 agent.checkpoint_path 热启动权重 (strict=False 加载,
+    # 因此可以跨配置加载: 例如用无 world model 的主体验权重初始化后,
+    # 再联合训练 world model)。checkpoint_path 为空时该调用是 no-op。
+    logger.info("Initializing Agent (warm-start from checkpoint if provided)")
+    agent.initialize()
+
     logger.info("Building Lightning Module")
     lightning_module = AgentLightningModule(
         agent=agent,

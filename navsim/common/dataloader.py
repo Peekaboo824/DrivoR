@@ -12,11 +12,51 @@ from navsim.common.dataclasses import AgentInput, Scene, SceneFilter, SensorConf
 from navsim.planning.metric_caching.metric_cache import MetricCache
 
 
-def filter_scenes(data_path: Path, scene_filter: SceneFilter) -> Dict[str, List[Dict[str, Any]]]:
+def _has_missing_camera_image(
+    frame_list: List[Dict[str, Any]],
+    sensor_blobs_path: Path,
+    sensor_config: SensorConfig,
+    num_history_frames: int,
+) -> bool:
+    """
+    Check whether any required history camera image is absent from disk.
+
+    Only the history window (frame index < num_history_frames) is validated.
+    Future frames declared by the sensor config (e.g. the world-model target
+    frame) are deliberately skipped: a missing future image must not discard
+    the whole scene. Such a scene is kept and trains exactly like the baseline,
+    while the world-model branch is masked out via world_valid=False.
+    :param frame_list: list of frames belonging to one scene
+    :param sensor_blobs_path: root directory of sensor data
+    :param sensor_config: sensor loading specification; sensors are matched by frame index
+    :param num_history_frames: number of leading frames that every sample must have
+    :return: True if at least one required history camera image is missing
+    """
+    for frame_idx, frame in enumerate(frame_list):
+        if frame_idx >= num_history_frames:
+            continue
+        cameras = frame["cams"]
+        for sensor_name in sensor_config.get_sensors_at_iteration(frame_idx):
+            camera_key = sensor_name.upper()
+            if camera_key not in cameras:
+                continue
+            if not (sensor_blobs_path / cameras[camera_key]["data_path"]).exists():
+                return True
+    return False
+
+
+def filter_scenes(
+    data_path: Path,
+    scene_filter: SceneFilter,
+    sensor_blobs_path: Path = None,
+    sensor_config: SensorConfig = None,
+) -> Dict[str, List[Dict[str, Any]]]:
     """
     Load a set of scenes from dataset, while applying scene filter configuration.
     :param data_path: root directory of log folder
     :param scene_filter: scene filtering configuration class
+    :param sensor_blobs_path: root directory of sensor data, used to skip scenes with missing images
+    :param sensor_config: sensor loading specification, used to validate every frame that will be loaded
     :return: dictionary of raw logs format
     """
 
@@ -26,6 +66,13 @@ def filter_scenes(data_path: Path, scene_filter: SceneFilter) -> Dict[str, List[
 
     filtered_scenes: Dict[str, Scene] = {}
     stop_loading: bool = False
+
+    if sensor_blobs_path is not None and Path(sensor_blobs_path / "invalid_tokens.yaml").exists():
+        with open(sensor_blobs_path / "invalid_tokens.yaml", "r") as f:
+            invalid_tokens = yaml.safe_load(f)["invalid_tokens"]
+        invalid_tokens_set = set(invalid_tokens)
+    else:
+        invalid_tokens_set = set()
 
     # filter logs
     log_files = list(data_path.iterdir())
@@ -54,6 +101,28 @@ def filter_scenes(data_path: Path, scene_filter: SceneFilter) -> Dict[str, List[
             token = frame_list[scene_filter.num_history_frames - 1]["token"]
             if filter_tokens and token not in tokens:
                 continue
+
+            # filter scenes whose log is listed in invalid_tokens.yaml
+            if sensor_blobs_path is not None:
+                camera_path = frame_list[scene_filter.num_history_frames - 1]["cams"]["CAM_R0"]["data_path"]
+                image_root = "/".join(str(sensor_blobs_path / camera_path).split("/")[:-2])
+                if image_root.split("/")[-1] in invalid_tokens_set:
+                    continue
+
+                # filter scenes with any missing camera image in the current frame
+                if any(
+                    not (sensor_blobs_path / camera_dict["data_path"]).exists()
+                    for camera_dict in frame_list[scene_filter.num_history_frames - 1]["cams"].values()
+                ):
+                    continue
+
+                # filter scenes with any missing camera image in the history
+                # window the sensor config will load (future frames excluded)
+                if sensor_config is not None and _has_missing_camera_image(
+                    frame_list, sensor_blobs_path, sensor_config,
+                    scene_filter.num_history_frames,
+                ):
+                    continue
 
             filtered_scenes[token] = frame_list
 
@@ -177,7 +246,7 @@ class SceneLoader:
             #         print("Writing invalid tokens to ", sensor_blobs_path / "invalid_tokens.yaml")
             #         yaml.dump({"invalid_tokens": invalid_token_paths}, f, default_flow_style=False)
         else:
-            self.scene_frames_dicts = filter_scenes(data_path, scene_filter)
+            self.scene_frames_dicts = filter_scenes(data_path, scene_filter, sensor_blobs_path, sensor_config)
         self._sensor_blobs_path = sensor_blobs_path
         self._scene_filter = scene_filter
         self._sensor_config = sensor_config

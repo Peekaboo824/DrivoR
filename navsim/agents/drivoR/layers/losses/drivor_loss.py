@@ -133,6 +133,7 @@ class DrivoRLoss(torch.nn.Module):
                         agent_class_weight: float = 1.0,
                         agent_box_weight: float = 1.0,
                         bev_semantic_weight: float = 1.0,
+                        world_loss_weight: float = 0.0,
                         **kwargs):
         super().__init__()
 
@@ -147,6 +148,7 @@ class DrivoRLoss(torch.nn.Module):
         self.agent_class_weight = agent_class_weight
         self.agent_box_weight = agent_box_weight
         self.bev_semantic_weight = bev_semantic_weight
+        self.world_loss_weight = world_loss_weight
 
 
     def score_loss(self, pred_logit, pred_logit2, agents_state, pred_area_logits, target_scores, gt_states, gt_valid,
@@ -304,6 +306,37 @@ class DrivoRLoss(torch.nn.Module):
         else:
             bev_semantic_loss = 0
 
+
+        # ================================================================
+        # LAW-style future-register prediction loss
+        # ================================================================
+        if (
+            "world_pred" in pred
+            and "world_target" in pred
+        ):
+            # Compute latent L2 in FP32 for numerical stability
+            # under mixed precision training.
+            world_diff = (
+                pred["world_pred"].float()
+                - pred["world_target"].float()
+            )
+
+            # Per-register Euclidean distance:
+            # [B_valid, N_reg, D]
+            #       ->
+            # [B_valid, N_reg]
+            world_loss = torch.linalg.vector_norm(
+                world_diff,
+                ord=2,
+                dim=-1,
+            ).mean()
+
+        else:
+            # Keeps correct device/dtype and does not create a graph.
+            world_loss = (
+                trajectory_loss.new_zeros(())
+            )
+
         loss = (
                 self.trajectory_weight * trajectory_loss
                 # + self.sub_score_weight * sub_score_loss
@@ -314,6 +347,7 @@ class DrivoRLoss(torch.nn.Module):
                 + self.agent_class_weight * agent_class_loss
                 + self.agent_box_weight * agent_box_loss
                 + self.bev_semantic_weight * bev_semantic_loss
+                + self.world_loss_weight * world_loss
 
         )
 
@@ -338,6 +372,21 @@ class DrivoRLoss(torch.nn.Module):
             'pred_ce_loss': pred_ce_loss,
             'pred_l1_loss': pred_l1_loss,
             'pred_area_loss': pred_area_loss,
+            "world_loss": world_loss,
+            "world_valid_rate": pred.get(
+                "world_valid_rate",
+                world_loss.new_tensor(0.0),
+            ),
+            # curriculum 诊断: 这两个值由 DrivoRAgent.compute_loss 写入,
+            # 用于确认 start_epoch 切换是否正确生效。
+            "world_model_active": pred.get(
+                "world_model_active",
+                trajectory_loss.new_tensor(0.0),
+            ),
+            "world_loss_weight_effective": pred.get(
+                "world_loss_weight_effective",
+                trajectory_loss.new_tensor(0.0),
+            ),
             "inter_loss0": inter_loss0,
             # "inter_loss1": inter_loss1,
             "inter_loss": inter_loss,

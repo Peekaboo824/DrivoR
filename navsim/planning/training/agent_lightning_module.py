@@ -28,17 +28,18 @@ class AgentLightningModule(pl.LightningModule):
         self.checkpoint_file=None
         self.for_viz = for_viz
 
-    def _step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], logging_prefix: str) -> Tensor:
+    def _step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], logging_prefix: str, current_epoch: int = None) -> Tensor:
         """
         Propagates the model forward and backwards and computes/logs losses and metrics.
         :param batch: tuple of dictionaries for feature and target tensors (batched)
         :param logging_prefix: prefix where to log step
+        :param current_epoch: PL current epoch, 仅训练时使用 (world-model curriculum)
         :return: scalar loss
         """
         features, targets = batch
 
         prediction = self.agent.forward(features)
-        loss_dict = self.agent.compute_loss(features, targets, prediction)
+        loss_dict = self.agent.compute_loss(features, targets, prediction, current_epoch=current_epoch)
 
         if type(loss_dict) is dict:
             for key,value in loss_dict.items():
@@ -54,7 +55,7 @@ class AgentLightningModule(pl.LightningModule):
         :param batch_idx: index of batch (ignored)
         :return: scalar loss
         """
-        return self._step(batch, "train")
+        return self._step(batch, "train", current_epoch=self.current_epoch)
 
     def validation_step(self, batch: Tuple[Dict[str, Tensor], Dict[str, Tensor]], batch_idx: int):
         """

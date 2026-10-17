@@ -94,6 +94,31 @@ config:
     time_horizon: 4
     interval_length: 0.5
 
+  # LAW-style latent world model (访问路径: config.world_model.*)
+  #
+  # enabled     : 整个实验是否包含 world model (决定模块是否创建, 不在训练中改写)
+  # start_epoch : 从哪个 epoch 起真正启用 world-model training branch
+  #               0  => 等价于从头 joint training
+  #               15 => 前 15 epoch 只训 DrivoR, 之后才加入 world supervision
+  world_model:
+    enabled: true
+    start_epoch: 15
+
+    future_offset_frames: 1
+
+    # soft-argmin temperature for world-model action selection:
+    # 每帧动作由全部 proposal 按 softmax(-match_error / T) 加权平均得到,
+    # T 越小越接近硬 argmin, 越大越平滑 (梯度覆盖越广).
+    action_temperature: 1.0
+
+    num_layers: 2
+    nhead: 8
+    dim_feedforward: 1024
+    dropout: 0.0
+
+    use_heading: false
+
+    detach_target: true
 
 
 loss:
@@ -110,16 +135,24 @@ loss:
   agent_box_weight: 0.1
   bev_semantic_weight: 1.0
   div_weight: 0.0
+  world_loss_weight: 0.03
 
 
 checkpoint_path: ''
-lr_args: 
+# 训练时热启动权重 (strict=False 加载, 允许跨配置)。
+# 留空则从头训练。与 checkpoint_path 不同, 它不影响训练/eval 模式判断。
+warm_start_path: ''
+lr_args:
   name: AdamW
   base_lr: 5e-4
   base_batch_size: 64
-scheduler_args: 
+scheduler_args:
   num_epochs: ${trainer.params.max_epochs}
-  dataset_size: 85000 # for navsim
+  # navtrain 实际场景数。用于 T_max = ceil(dataset_size / global_batch) * num_epochs,
+  # 所以必须等于真实训练集大小, 否则 LR 会在训练结束前归零 (甚至反向回升)。
+  # 旧值 85000 对不上: baseline 真实为 ~102592, 且 world_model 未来帧过滤曾把
+  # 训练集压到 ~84736, 使该值恰好"看起来"正确。dataloader 修好后恢复 ~102640。
+  dataset_size: 102640 # for navsim (navtrain scene count)
 
 batch_size: ${dataloader.params.batch_size}
 num_gpus: 1 # the batchsize is per gpu --> need to update for steps
